@@ -10,7 +10,27 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 // Store active rooms
 const rooms = new Map();
-wss.on('connection', (ws) => {
+// Flash Policy File Handling (Required for Flash Sockets)
+server.on('connection', (socket) => {
+    socket.once('data', (chunk) => {
+        // Check if it's a Flash Policy Request
+        if (chunk.toString().indexOf('<policy-file-request/>') !== -1) {
+            // console.log("Serving Flash Policy File");
+            const policy = '<?xml version="1.0"?><cross-domain-policy><allow-access-from domain="*" to-ports="*" /></cross-domain-policy>\0';
+            socket.write(policy);
+            socket.end();
+        } else {
+            // Not a policy request, put data back and let HTTP server handle it
+            socket.pause();
+            socket.unshift(chunk);
+            socket.resume();
+            // We must manually emit the 'connection' event for the HttpServer if we intercepted it? 
+            // Actually http server listens on 'connection' too. But by consuming 'data', we might have triggered flow.
+            // unshift puts it back. Ideally ensuring http server also gets it.
+        }
+    });
+});
+wss.on('connection', (ws, req) => {
     // console.log('New client connected');
     ws.isAlive = true;
     ws.lastHeartbeat = Date.now();
