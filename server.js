@@ -8,7 +8,7 @@ app.use(cors());
 app.use(express.json());
 
 const FIREBASE_URL = "https://icy-tower-rejumped-default-rtdb.europe-west1.firebasedatabase.app";
-const PORT = 8080;
+const PORT = process.env.PORT || 8080;
 
 app.get('/crossdomain.xml', (req, res) => {
     console.log("[HTTP] Serving crossdomain.xml");
