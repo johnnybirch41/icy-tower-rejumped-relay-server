@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Icy Tower Rejumped</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        #game-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+    </style>
+    <script src="websocket-bridge.js"></script>
+</head>
+<body>
+    <div id="game-container">
+        <object type="application/x-shockwave-flash" data="ITFB.swf" width="630" height="520" id="game">
+            <param name="movie" value="ITFB.swf">
+            <param name="quality" value="high">
+            <param name="bgcolor" value="#000000">
+            <param name="allowScriptAccess" value="always">
+            <param name="wmode" value="direct">
+        </object>
+    </div>
+
+    <script>
+        // Ensure callback is available globally
+        window.flashWebSocketCallback = function(socketId, eventType, data) {
+            // This will be called by the JavaScript bridge and forwarded to Flash
+            console.log('[WebSocket Bridge] Event:', eventType, 'Socket ID:', socketId);
+        };
+    </script>
+</body>
+</html>
