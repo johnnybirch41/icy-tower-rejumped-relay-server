@@ -1,160 +1,201 @@
 const WebSocket = require('ws');
 const http = require('http');
-const PORT = process.env.PORT || 8080;
-// Create HTTP server (required for Render health checks)
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Icy Tower Rejumped Relay Server is Running!\n');
+const express = require('express');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const FIREBASE_URL = "https://icy-tower-rejumped-default-rtdb.europe-west1.firebasedatabase.app";
+const PORT = 8080;
+
+app.get('/crossdomain.xml', (req, res) => {
+    console.log("[HTTP] Serving crossdomain.xml");
+    res.set('Content-Type', 'text/xml');
+    res.send(`<?xml version="1.0"?>
+<!DOCTYPE cross-domain-policy SYSTEM "http://www.adobe.com/xml/dtds/cross-domain-policy.dtd">
+<cross-domain-policy>
+    <site-control permitted-cross-domain-policies="all"/>
+    <allow-access-from domain="*" to-ports="*" secure="false"/>
+    <allow-http-request-headers-from domain="*" headers="*"/>
+</cross-domain-policy>`);
 });
-// Create WebSocket server
-const wss = new WebSocket.Server({ server });
-// Store active rooms
-const rooms = new Map();
-// Flash Policy File Handling (Required for Flash Sockets)
-server.on('connection', (socket) => {
-    socket.once('data', (chunk) => {
-        // Check if it's a Flash Policy Request
-        if (chunk.toString().indexOf('<policy-file-request/>') !== -1) {
-            // console.log("Serving Flash Policy File");
-            const policy = '<?xml version="1.0"?><cross-domain-policy><allow-access-from domain="*" to-ports="*" /></cross-domain-policy>\0';
-            socket.write(policy);
-            socket.end();
-        } else {
-            // Not a policy request, put data back and let HTTP server handle it
-            socket.pause();
-            socket.unshift(chunk);
-            socket.resume();
-            // We must manually emit the 'connection' event for the HttpServer if we intercepted it? 
-            // Actually http server listens on 'connection' too. But by consuming 'data', we might have triggered flow.
-            // unshift puts it back. Ideally ensuring http server also gets it.
+
+const proxyToFirebase = (method, path, body, res) => {
+    const https = require('https');
+    const options = {
+        method: method,
+        headers: {
+            'Content-Type': 'application/json'
         }
-    });
-});
-wss.on('connection', (ws, req) => {
-    // console.log('New client connected');
-    ws.isAlive = true;
-    ws.lastHeartbeat = Date.now();
-    ws.on('message', (data) => {
-        try {
-            // Expecting JSON packets
-            const message = JSON.parse(data);
-            switch (message.type) {
-                case 'join':
-                    handleJoin(ws, message);
-                    break;
-                case 'start_game': // New handler
-                    // Broadcast to everyone including sender (so host knows it sent?)
-                    // Actually host calls startGame() locally. Just broadcast to others.
-                    broadcast(ws.room, { type: 'start_game' }, ws);
-                    break;
-                case 'sync':
-                    handleSync(ws, message);
-                    break;
-                case 'leave':
-                    handleLeave(ws);
-                    break;
-                case 'ping': // Keep-alive from client
-                    ws.send(JSON.stringify({ type: 'pong' }));
-                    break;
-                default:
-                // console.log('Unknown message type:', message.type);
+    };
+
+    const req = https.request(FIREBASE_URL + path, options, (firebaseRes) => {
+        let data = '';
+        firebaseRes.on('data', (chunk) => data += chunk);
+        firebaseRes.on('end', () => {
+            res.status(firebaseRes.statusCode).set('Access-Control-Allow-Origin', '*');
+            try {
+                const json = JSON.parse(data);
+                res.json(json);
+            } catch (e) {
+                res.send(data);
             }
-        } catch (error) {
-            console.error('Error parsing message:', error);
+        });
+    });
+
+    req.on('error', (e) => {
+        console.error("Firebase Error:", e.message);
+        res.status(500).json({ error: e.message });
+    });
+
+    if (body) {
+        req.write(JSON.stringify(body));
+    }
+    req.end();
+};
+
+app.get('/api/lobbies.json', (req, res) => {
+    proxyToFirebase('GET', '/lobbies.json', null, res);
+});
+
+app.post('/api/lobbies/:id.json', (req, res) => {
+    const method = req.query['x-http-method-override'] || 'POST';
+    const query = req.query['x-http-method-override'] ? `?x-http-method-override=${req.query['x-http-method-override']}` : '';
+    proxyToFirebase('POST', `/lobbies/${req.params.id}.json${query}`, req.body, res);
+});
+
+app.get('/api/lobbies/:id.json', (req, res) => {
+    proxyToFirebase('GET', `/lobbies/${req.params.id}.json`, null, res);
+});
+
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+const rooms = {};
+
+
+const deleteFirebaseLobby = (lobbyCode) => {
+    const https = require('https');
+    const options = {
+        method: 'DELETE',
+        headers: {
+            'Content-Type': 'application/json'
+        }
+    };
+
+    const req = https.request(FIREBASE_URL + `/lobbies/${lobbyCode}.json`, options, (firebaseRes) => {
+        let data = '';
+        firebaseRes.on('data', (chunk) => data += chunk);
+        firebaseRes.on('end', () => {
+            if (firebaseRes.statusCode === 200 || firebaseRes.statusCode === 204) {
+                console.log(`[Firebase] Lobby ${lobbyCode} deleted successfully`);
+            } else {
+                console.log(`[Firebase] Delete lobby ${lobbyCode} returned status ${firebaseRes.statusCode}`);
+            }
+        });
+    });
+
+    req.on('error', (e) => {
+        console.error(`[Firebase] Delete lobby ${lobbyCode} error:`, e.message);
+    });
+
+    req.end();
+};
+
+wss.on('connection', (ws) => {
+    console.log('[WS] Client connected');
+    ws.room = null;
+    ws.pid = null;
+
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+
+            if (data.type === 'join') {
+                ws.room = data.room;
+                ws.pid = data.player_id;
+
+                if (!rooms[ws.room]) rooms[ws.room] = [];
+                rooms[ws.room].push(ws);
+
+                console.log(`[WS] ${ws.pid} joined ${ws.room}`);
+
+                broadcastToRoom(ws.room, {
+                    type: 'player_joined',
+                    player_id: ws.pid
+                }, ws);
+
+                const existing = rooms[ws.room].filter(c => c !== ws).map(c => c.pid);
+                if (existing.length > 0) {
+                    ws.send(JSON.stringify({
+                        type: 'existing_players',
+                        players: existing
+                    }));
+                }
+            }
+            else if (data.type === 'sync') {
+                if (ws.room) {
+                    data.player_id = ws.pid;
+                    broadcastToRoom(ws.room, data, ws);
+                }
+            }
+            else if (data.type === 'ping') { }
+            else {
+                if (ws.room) broadcastToRoom(ws.room, data, ws);
+            }
+
+        } catch (e) {
+            console.error('[WS] Error parsing message:', e);
         }
     });
-    ws.on('pong', () => {
-        ws.isAlive = true;
-        ws.lastHeartbeat = Date.now();
-    });
+
     ws.on('close', () => {
-        handleLeave(ws);
-    });
-    ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
+        if (ws.room && rooms[ws.room]) {
+            console.log(`[WS] ${ws.pid} left room ${ws.room}`);
+            rooms[ws.room] = rooms[ws.room].filter(client => client !== ws);
+
+            broadcastToRoom(ws.room, {
+                type: 'player_left',
+                player_id: ws.pid
+            });
+
+            if (rooms[ws.room].length === 0) {
+                const roomCode = ws.room;
+                delete rooms[roomCode];
+                console.log(`[WS] Room ${roomCode} deleted (empty)`);
+                // Delete from Firebase as well
+                deleteFirebaseLobby(roomCode);
+            }
+        }
     });
 });
-function handleJoin(ws, message) {
-    const { room, player_id } = message;
-    if (!rooms.has(room)) {
-        rooms.set(room, new Map());
-    }
-    const roomClients = rooms.get(room);
-    // Add client to room
-    ws.room = room;
-    ws.player_id = player_id;
-    roomClients.set(player_id, ws);
-    console.log(`Player ${player_id} joined room ${room}`);
-    // Notify others
-    broadcast(room, {
-        type: 'player_joined',
-        player_id: player_id
-    }, ws);
-    // Send existing players to new client
-    const existingPlayers = [];
-    roomClients.forEach((client, id) => {
-        if (id !== player_id && client.readyState === WebSocket.OPEN) {
-            existingPlayers.push(id);
-        }
-    });
-    if (existingPlayers.length > 0) {
-        ws.send(JSON.stringify({
-            type: 'existing_players',
-            players: existingPlayers
-        }));
+
+function broadcastToRoom(room, data, sender = null) {
+    if (rooms[room]) {
+        const msg = JSON.stringify(data);
+        let count = 0;
+        rooms[room].forEach(client => {
+            if (client !== sender && client.readyState === WebSocket.OPEN) {
+                client.send(msg);
+                count++;
+            }
+        });
+        // if (data.type === 'sync') console.log(`[WS] Broadcast sync to ${count} clients in ${room}`);
+    } else {
+        console.log(`[WS] Broadcast failed: Room ${room} not found`);
     }
 }
-function handleSync(ws, message) {
-    if (!ws.room) return;
-    // Re-broadcast sync frame to everyone else in the room
-    // We strip unnecessary metadata to save bandwidth if needed, but for now passing through is fine
-    broadcast(ws.room, {
-        type: 'sync',
-        id: ws.player_id,
-        x: message.x,       // position x
-        y: message.y,       // position y
-        vx: message.vx,     // velocity x
-        vy: message.vy,     // velocity y
-        f: message.f,       // current frame (animation)
-        s: message.s        // scale/facing (-1 or 1)
-    }, ws);
-}
-function handleLeave(ws) {
-    if (!ws.room) return;
-    const roomClients = rooms.get(ws.room);
-    if (roomClients) {
-        roomClients.delete(ws.player_id);
-        // Notify others
-        broadcast(ws.room, {
-            type: 'player_left',
-            player_id: ws.player_id
-        }, ws);
-        if (roomClients.size === 0) {
-            rooms.delete(ws.room);
-        }
-    }
-}
-function broadcast(room, message, excludeWs = null) {
-    const roomClients = rooms.get(room);
-    if (!roomClients) return;
-    const messageStr = JSON.stringify(message);
-    roomClients.forEach((client) => {
-        if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
-            client.send(messageStr);
-        }
-    });
-}
-// Start server
+
 server.listen(PORT, () => {
-    console.log(`Relay Server running on port ${PORT}`);
+    console.log(`
+    ========================================
+    ITFB PROXY + RELAY SERVER STARTED
+    ========================================
+    HTTP Proxy: http://localhost:${PORT}/api/
+    Crossdomain: http://localhost:${PORT}/crossdomain.xml
+    WebSocket: ws://localhost:${PORT}
+    ========================================
+    `);
 });
-// Basic cleanup interval for zombie connections
-const PING_INTERVAL = 30000;
-const TIMEOUT = 40000;
-setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (Date.now() - ws.lastHeartbeat > TIMEOUT) {
-            ws.terminate();
-        }
-    });
-}, PING_INTERVAL);
